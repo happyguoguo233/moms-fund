@@ -327,7 +327,6 @@ def get_stock_realtime_price_batch(stock_codes):
         return price_map, change_map
     return {}, {}
 
-@st.cache_data(ttl=86400) # 每天更新一次持仓即可
 def get_fund_portfolio(fund_code):
     """获取基金前十大重仓股"""
     try:
@@ -602,7 +601,7 @@ def fetch_all_funds_data(funds_list):
             print(f"获取持仓失败 {code}: {e}")
             return code, []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         futures = [executor.submit(fetch_portfolio_item, fund) for fund in funds_list]
         for future in concurrent.futures.as_completed(futures):
             code, portfolio = future.result()
