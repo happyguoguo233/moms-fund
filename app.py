@@ -163,7 +163,7 @@ def load_funds():
             return record
         return []
     except Exception as e:
-        print(f"云端读取失败，回退本地: {e}")
+        st.error(f"云端连接错误: {e}")
         if not os.path.exists(DATA_FILE):
             return []
         try:
@@ -184,7 +184,7 @@ def save_funds(data):
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"云端保存失败: {e}")
+        st.error(f"云端连接错误: {e}")
 
 # ==========================================
 # 核心数据获取逻辑 (并发加速)
@@ -803,11 +803,6 @@ def main():
     selected_group = st.session_state.selected_group
     display_funds = current_funds if selected_group == "全部" else [f for f in current_funds if f.get('group') == selected_group]
 
-    if not display_funds:
-        st.info("👋 暂无基金，请在左侧添加。")
-        render_sidebar(current_funds)
-        return
-
     indices = get_all_market_indices()
     st.markdown("## 📊 市场大盘")
     if indices:
@@ -835,6 +830,11 @@ def main():
                     """,
                     unsafe_allow_html=True
                 )
+
+    if not display_funds:
+        st.info("👋 暂无基金，请在左侧添加。")
+        render_sidebar(current_funds)
+        return
 
     with st.spinner('正在获取最新行情...'):
         market_data = fetch_all_funds_data(display_funds)
