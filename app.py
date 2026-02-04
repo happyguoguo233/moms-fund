@@ -6,6 +6,7 @@ import os
 import time
 import re
 import requests
+import random
 from datetime import datetime
 import concurrent.futures
 import plotly.graph_objects as go
@@ -485,7 +486,7 @@ def get_all_market_indices():
 # 核心数据获取逻辑 (并发加速 + 重仓股估值)
 # ==========================================
 @st.cache_data(ttl=60)
-def calculate_fund_valuation(fund_code, fund_name, a_prices, a_changes):
+def calculate_fund_valuation(fund_code, fund_name, a_prices, a_changes, portfolio=None):
     """
     计算基金实时估值
     逻辑：实时估值涨跌幅 = Σ(重仓股涨跌幅 * 持仓占比) / Σ(已知持仓占比)
@@ -512,7 +513,8 @@ def calculate_fund_valuation(fund_code, fund_name, a_prices, a_changes):
             }
 
         # 2. 获取持仓
-        portfolio = get_fund_portfolio(fund_code)
+        if portfolio is None:
+            portfolio = get_fund_portfolio(fund_code)
         
         if not portfolio:
             # 如果没有持仓数据，只能返回昨日数据
@@ -586,15 +588,29 @@ def fetch_all_funds_data(funds_list):
     2. 顺序计算每只基金估值 (避免多线程导致的崩溃)
     """
     results = {}
-
+    portfolio_map = {}
     wanted_codes = set()
-    for fund in funds_list:
-        portfolio = get_fund_portfolio(fund['code'])
-        time.sleep(0.2)
-        for stock in portfolio:
-            s_code = str(stock['code']).split(".")[-1][-6:]
-            if s_code:
-                wanted_codes.add(s_code)
+
+    def fetch_portfolio_item(fund):
+        code = fund.get("code")
+        try:
+            time.sleep(random.uniform(0.1, 0.3))
+            portfolio = get_fund_portfolio(code)
+            return code, portfolio
+        except Exception as e:
+            traceback.print_exc()
+            print(f"获取持仓失败 {code}: {e}")
+            return code, []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(fetch_portfolio_item, fund) for fund in funds_list]
+        for future in concurrent.futures.as_completed(futures):
+            code, portfolio = future.result()
+            portfolio_map[code] = portfolio or []
+            for stock in portfolio_map[code]:
+                s_code = str(stock['code']).split(".")[-1][-6:]
+                if s_code:
+                    wanted_codes.add(s_code)
 
     a_prices, a_changes = {}, {}
     if wanted_codes:
@@ -611,7 +627,8 @@ def fetch_all_funds_data(funds_list):
                 f.get("code"),
                 f.get("name"),
                 a_prices,
-                a_changes
+                a_changes,
+                portfolio_map.get(code, [])
             )
             if data:
                 results[code] = data
@@ -836,7 +853,7 @@ def main():
         render_sidebar(current_funds)
         return
 
-    with st.spinner('正在获取最新行情...'):
+    with st.spinner('正在并发加载数据，请稍候...'):
         market_data = fetch_all_funds_data(display_funds)
 
     total_market_value = 0.0
