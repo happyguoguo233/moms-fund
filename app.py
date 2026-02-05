@@ -18,6 +18,7 @@ import traceback
 # ==========================================
 DATA_FILE = "funds.json"
 UPDATE_INTERVAL = 30  # 自动刷新间隔（秒）
+FUNDS_CACHE_TTL_SECONDS = 60  # 持仓列表缓存时长（秒）
 COLOR_UP = "#D22222"  # 红色（涨）
 COLOR_DOWN = "#008000"  # 绿色（跌）
 COLOR_NEUTRAL = "#333333"  # 灰色（平）
@@ -47,6 +48,12 @@ if "last_update" not in st.session_state:
     st.session_state.last_update = datetime.now()
 if "all_funds_list" not in st.session_state:
     st.session_state.all_funds_list = None
+if "funds_cache" not in st.session_state:
+    st.session_state.funds_cache = None
+if "funds_cache_time" not in st.session_state:
+    st.session_state.funds_cache_time = None
+if "board_panel_cache" not in st.session_state:
+    st.session_state.board_panel_cache = None
 
 
 # ==========================================
@@ -214,8 +221,35 @@ def save_funds(data):
         resp.raise_for_status()
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+
+        st.session_state.funds_cache = data
+        st.session_state.funds_cache_time = datetime.now()
     except Exception as e:
         st.error(f"云端连接错误: {e}")
+
+
+def get_current_funds(force_refresh=False):
+    if force_refresh:
+        st.session_state.funds_cache = None
+        st.session_state.funds_cache_time = None
+
+    now = datetime.now()
+    cache = st.session_state.get("funds_cache")
+    cache_time = st.session_state.get("funds_cache_time")
+
+    if cache is None or cache_time is None:
+        cache = load_funds()
+        st.session_state.funds_cache = cache
+        st.session_state.funds_cache_time = now
+        return cache
+
+    if (now - cache_time).total_seconds() > FUNDS_CACHE_TTL_SECONDS:
+        cache = load_funds()
+        st.session_state.funds_cache = cache
+        st.session_state.funds_cache_time = now
+        return cache
+
+    return cache
 
 # ==========================================
 # 核心数据获取逻辑 (并发加速)
@@ -364,6 +398,7 @@ def get_stock_realtime_price_batch(stock_codes):
         return price_map, change_map
     return {}, {}
 
+@st.cache_data(ttl=86400, persist="disk")
 def get_fund_portfolio(fund_code):
     """获取基金前十大重仓股"""
     try:
@@ -573,6 +608,10 @@ def get_board_name_pool_fallback():
         concept = ak.stock_board_concept_name_em()
     except Exception:
         concept = pd.DataFrame()
+
+    industry_count = 0 if industry is None or industry.empty else int(len(industry))
+    concept_count = 0 if concept is None or concept.empty else int(len(concept))
+
     if not industry.empty:
         name_col = pick_col(industry, ["板块名称", "名称", "行业名称"], contains=["板块", "名称", "行业"])
         if name_col:
@@ -582,7 +621,19 @@ def get_board_name_pool_fallback():
         if name_col:
             names.extend(concept[name_col].dropna().astype(str).tolist())
     names = [n.strip() for n in names if str(n).strip()]
-    return list(dict.fromkeys(names))
+    unique_names = list(dict.fromkeys(names))
+
+    if not unique_names:
+        raise RuntimeError("board name pool is empty")
+
+    now = datetime.now(pytz.timezone('Asia/Shanghai'))
+    return {
+        "ok": True,
+        "names": unique_names,
+        "industry_count": industry_count,
+        "concept_count": concept_count,
+        "fetched_at": now.strftime("%Y-%m-%d %H:%M:%S")
+    }
 
 # ==========================================
 # 核心数据获取逻辑 (并发加速 + 重仓股估值)
@@ -602,20 +653,48 @@ def calculate_fund_valuation(fund_code, fund_name, a_prices, a_changes, portfoli
         last_nav = float(df_nav.iloc[-1]['单位净值'])
         last_date = str(df_nav.iloc[-1]['净值日期'])
         last_nav_date = pd.to_datetime(df_nav.iloc[-1]['净值日期']).date()
+
+        def build_portfolio_details(items, change_map):
+            if not items:
+                return []
+            details = []
+            for stock in items:
+                s_code = normalize_stock_code(stock.get('code'))
+                ratio = stock.get('ratio', 0)
+                change = 0.0
+                if s_code and s_code in change_map:
+                    change = change_map[s_code]
+                details.append({
+                    "name": stock.get('name', ''),
+                    "change": change,
+                    "ratio": ratio
+                })
+            return details
+
         now = datetime.now(pytz.timezone('Asia/Shanghai'))
         if last_nav_date == now.date():
+            official_change_pct = 0.0
+            try:
+                if len(df_nav) >= 2:
+                    prev_nav = float(df_nav.iloc[-2]['单位净值'])
+                    if prev_nav > 0:
+                        official_change_pct = (last_nav / prev_nav - 1) * 100
+            except Exception:
+                official_change_pct = 0.0
+
+            portfolio_details = build_portfolio_details(portfolio, a_changes) if portfolio else []
             return {
                 "code": fund_code,
                 "name": fund_name,
                 "current_price": last_nav,
-                "change_pct": 0.0,
+                "change_pct": official_change_pct,
                 "nav_date": last_date,
                 "update_time": "✅ 官方更新",
                 "is_estimated": False,
-                "portfolio": [],
+                "portfolio": portfolio_details,
                 "last_nav": last_nav
             }
-        
+
         if not a_changes:
             return {
                 "code": fund_code,
@@ -797,19 +876,29 @@ def get_fund_name(code):
 def render_sidebar(current_funds):
     with st.sidebar:
         st.header("🛠 管理与操作")
+
+        if st.button("🔄 刷新重仓股缓存", use_container_width=True):
+            try:
+                get_fund_portfolio.clear()
+            except Exception:
+                pass
+            st.session_state.last_update = datetime.now()
+            st.rerun()
         
         # 自动刷新开关
         st.toggle("自动刷新 (每30秒)", key="auto_refresh")
         if st.session_state.auto_refresh:
-            time_diff = (datetime.now() - st.session_state.last_update).seconds
-            st.caption(f"上次更新: {st.session_state.last_update.strftime('%H:%M:%S')}")
+            now = datetime.now()
+            time_diff = int((now - st.session_state.last_update).total_seconds())
+            remaining = max(UPDATE_INTERVAL - time_diff, 0)
+            st.caption(
+                f"上次更新: {st.session_state.last_update.strftime('%H:%M:%S')}"
+                f" | 距离自动刷新: {remaining}s"
+            )
+            denom = max(UPDATE_INTERVAL, 1)
+            st.progress(min(time_diff / denom, 1.0))
             if time_diff >= UPDATE_INTERVAL:
-                st.session_state.last_update = datetime.now()
-                st.rerun()
-            else:
-                # 倒计时进度条
-                st.progress(time_diff / UPDATE_INTERVAL)
-                time.sleep(1) # 简单的轮询等待
+                st.session_state.last_update = now
                 st.rerun()
 
         def _do_add_fund(code, cost, shares, group_name):
@@ -952,9 +1041,69 @@ def render_sidebar(current_funds):
                     st.rerun()
 
         with st.expander("📋 无法命中？点此查询官方板块名"):
-            pool = get_board_name_pool_fallback()
+            c1, c2 = st.columns([1, 2])
+            with c1:
+                if st.button("🔄 刷新板块名缓存", use_container_width=True):
+                    try:
+                        get_board_name_pool_fallback.clear()
+                    except Exception:
+                        pass
+                    try:
+                        get_board_spot_map.clear()
+                    except Exception:
+                        pass
+                    for k in [
+                        "board_name_pool_names",
+                        "board_name_pool_ok",
+                        "board_name_pool_fetched_at",
+                        "board_name_pool_industry_count",
+                        "board_name_pool_concept_count",
+                        "board_name_pool_error",
+                        "board_spot_count",
+                        "board_spot_fetched_at"
+                    ]:
+                        st.session_state.pop(k, None)
+                    st.rerun()
+
+            spot_cnt = st.session_state.get("board_spot_count")
+            spot_ts = st.session_state.get("board_spot_fetched_at")
+            pool_ok = st.session_state.get("board_name_pool_ok")
+            pool_ts = st.session_state.get("board_name_pool_fetched_at")
+            industry_cnt = st.session_state.get("board_name_pool_industry_count")
+            concept_cnt = st.session_state.get("board_name_pool_concept_count")
+            pool_err = st.session_state.get("board_name_pool_error")
+
+            st.caption(
+                f"实时板块数：{spot_cnt if spot_cnt is not None else '-'}"
+                + (f"（{spot_ts}）" if spot_ts else "")
+            )
+            st.caption(
+                f"官方行业名数：{industry_cnt if industry_cnt is not None else '-'} | 官方概念名数：{concept_cnt if concept_cnt is not None else '-'}"
+                + (f"（{pool_ts}）" if pool_ts else "")
+            )
+            if pool_ok is False and pool_err:
+                st.caption(f"状态：失败 | {pool_err}")
+            elif pool_ok is True:
+                st.caption("状态：成功")
+
+            pool = st.session_state.get("board_name_pool_names")
+            if pool is None:
+                try:
+                    pool_data = get_board_name_pool_fallback()
+                    pool = pool_data.get("names", [])
+                    st.session_state["board_name_pool_names"] = pool
+                    st.session_state["board_name_pool_ok"] = True
+                    st.session_state["board_name_pool_fetched_at"] = pool_data.get("fetched_at")
+                    st.session_state["board_name_pool_industry_count"] = pool_data.get("industry_count")
+                    st.session_state["board_name_pool_concept_count"] = pool_data.get("concept_count")
+                    st.session_state.pop("board_name_pool_error", None)
+                except Exception as e:
+                    pool = []
+                    st.session_state["board_name_pool_ok"] = False
+                    st.session_state["board_name_pool_error"] = str(e)
+
             kw = st.text_input("搜索板块名称", key="board_name_search")
-            df = pd.DataFrame({"板块名称": pool})
+            df = pd.DataFrame({"板块名称": pool or []})
             if kw.strip():
                 df = df[df["板块名称"].astype(str).str.contains(kw.strip(), case=False, na=False)]
             st.dataframe(df, use_container_width=True, height=320)
@@ -1010,7 +1159,7 @@ def main():
             f"</div>"
         )
 
-    current_funds = load_funds()
+    current_funds = get_current_funds()
     if "selected_group" not in st.session_state:
         st.session_state.selected_group = None
     groups = ["全部"] + sorted(list(set(f.get("group", "默认") for f in current_funds)))
@@ -1051,62 +1200,120 @@ def main():
                         unsafe_allow_html=True
                     )
 
-    st.markdown("## 🧭 我的赛道")
-    tags = sorted(list(set(f.get("group", "默认") for f in current_funds)))
-    if not tags:
-        st.info("暂无标签")
-    else:
-        board_bar = st.progress(0, text="正在帮妈妈去交易所抄价格...")
-        try:
-            spot_map = get_board_spot_map()
-            spot_names = list(spot_map.keys())
-            name_pool = get_board_name_pool_fallback()
-            all_names = list(dict.fromkeys(spot_names + name_pool))
-            normalized_all_pool = [(n, normalize_board_keyword(n)) for n in all_names]
-            total = max(len(tags), 1)
-            for i, tag in enumerate(tags, start=1):
-                raw_key = str(tag).strip()
-                key = normalize_board_keyword(raw_key)
-                matches = [n for n, norm in normalized_all_pool if key and norm and (key in norm or norm in key)]
-                if matches:
-                    match = sorted(
-                        matches,
-                        key=lambda x: (len(normalize_board_keyword(x)) or 10**9, len(x), x)
-                    )[0]
-                    info = spot_map.get(match, {}) if match in spot_map else {}
-                    price = info.get("price") if match in spot_map else None
-                    change = info.get("change") if match in spot_map else None
-                    price_text = "-" if price is None else f"{price:.2f}"
-                    change_text = "-" if change is None else f"{change:+.2f}%"
-                    if change is None:
-                        color = "#7f7f7f"
-                    elif change > 0:
-                        color = "#d62728"
-                    elif change < 0:
-                        color = "#2ca02c"
-                    else:
-                        color = "#7f7f7f"
-                    extra = "" if match in spot_map else " <span style='color:#7f7f7f; font-size:12px;'>(暂无实时行情)</span>"
-                    st.markdown(
-                        f"**{tag}**：{match}{extra} | {price_text} | <span style='color:{color}; font-weight:700;'>{change_text}</span>",
-                        unsafe_allow_html=True
-                    )
-                else:
-                    candidates = suggest_board_candidates(key, normalized_all_pool, top=3)
-                    if candidates:
-                        suggest_text = " / ".join(candidates)
-                        st.markdown(
-                            f"<span style='color:#7f7f7f; font-size:12px;'>⚠️ 未找到与【{tag}】相关的板块，请尝试修改标签名（候选：{suggest_text}）</span>",
-                            unsafe_allow_html=True
-                        )
-                    else:
-                        st.markdown(
-                            f"<span style='color:#7f7f7f; font-size:12px;'>⚠️ 未找到与【{tag}】相关的板块，请尝试修改标签名</span>",
-                            unsafe_allow_html=True
-                        )
-                board_bar.progress(min(i / total, 1.0), text="正在帮妈妈去交易所抄价格...")
-        finally:
-            board_bar.empty()
+    with st.expander("🧭 我的赛道", expanded=False):
+        tags = sorted(list(set(f.get("group", "默认") for f in current_funds)))
+        if not tags:
+            st.info("暂无标签")
+        else:
+            c1, c2 = st.columns([1, 2])
+            with c1:
+                if st.button("📥 加载/刷新板块数据", use_container_width=True, type="primary", key="board_panel_refresh"):
+                    with st.spinner("正在帮妈妈去交易所抄价格..."):
+                        spot_map = get_board_spot_map()
+                        now = datetime.now(pytz.timezone('Asia/Shanghai'))
+                        st.session_state["board_spot_count"] = len(spot_map)
+                        st.session_state["board_spot_fetched_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
+
+                        try:
+                            pool_data = get_board_name_pool_fallback()
+                            name_pool = pool_data.get("names", [])
+                            st.session_state["board_name_pool_names"] = name_pool
+                            st.session_state["board_name_pool_ok"] = True
+                            st.session_state["board_name_pool_fetched_at"] = pool_data.get("fetched_at")
+                            st.session_state["board_name_pool_industry_count"] = pool_data.get("industry_count")
+                            st.session_state["board_name_pool_concept_count"] = pool_data.get("concept_count")
+                            st.session_state.pop("board_name_pool_error", None)
+                        except Exception as e:
+                            name_pool = st.session_state.get("board_name_pool_names") or []
+                            st.session_state["board_name_pool_ok"] = False
+                            st.session_state["board_name_pool_error"] = str(e)
+
+                        st.session_state.board_panel_cache = {
+                            "spot_map": spot_map,
+                            "name_pool": name_pool,
+                            "fetched_at": now.strftime("%Y-%m-%d %H:%M:%S")
+                        }
+                    st.rerun()
+
+            cache = st.session_state.get("board_panel_cache")
+            if not cache or not isinstance(cache, dict) or not cache.get("spot_map"):
+                st.markdown(
+                    """
+                    <div style="background-color:#ffffff; color:#000000; padding:15px; border-radius:10px; box-shadow:0 1px 3px rgba(0,0,0,0.1);">
+                      <div style="font-weight:700; font-size:16px;">板块数据未加载</div>
+                      <div style="margin-top:6px; font-size:13px; color:#666;">点击上方“加载/刷新板块数据”后才会请求接口。</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+            else:
+                spot_map = cache.get("spot_map") or {}
+                name_pool = cache.get("name_pool") or []
+                spot_names = list(spot_map.keys())
+                all_names = list(dict.fromkeys(spot_names + name_pool))
+                normalized_all_pool = [(n, normalize_board_keyword(n)) for n in all_names]
+
+                cols = st.columns(2)
+                for idx, tag in enumerate(tags):
+                    raw_key = str(tag).strip()
+                    key = normalize_board_keyword(raw_key)
+                    matches = [n for n, norm in normalized_all_pool if key and norm and (key in norm or norm in key)]
+
+                    with cols[idx % 2]:
+                        if matches:
+                            match = sorted(
+                                matches,
+                                key=lambda x: (len(normalize_board_keyword(x)) or 10**9, len(x), x)
+                            )[0]
+                            info = spot_map.get(match, {}) if match in spot_map else {}
+                            price = info.get("price") if match in spot_map else None
+                            change = info.get("change") if match in spot_map else None
+
+                            price_text = "-" if price is None else f"{price:.2f}"
+                            change_text = "-" if change is None else f"{change:+.2f}%"
+                            if change is None:
+                                color = "#7f7f7f"
+                                emoji = "⚪"
+                            elif change > 0:
+                                color = "#d62728"
+                                emoji = "🔴"
+                            elif change < 0:
+                                color = "#2ca02c"
+                                emoji = "🟢"
+                            else:
+                                color = "#7f7f7f"
+                                emoji = "⚪"
+
+                            extra_text = "" if match in spot_map else "暂无实时行情"
+                            subtitle = match if not extra_text else f"{match}（{extra_text}）"
+
+                            st.markdown(
+                                f"""
+                                <div style="background-color:#ffffff; color:#000000; padding:15px; border-radius:10px; box-shadow:0 1px 3px rgba(0,0,0,0.1); margin-bottom:12px;">
+                                  <div style="font-weight:700; font-size:16px;">{tag}</div>
+                                  <div style="margin-top:4px; font-size:12px; color:#666;">{subtitle}</div>
+                                  <div style="display:flex; justify-content:space-between; align-items:baseline; margin-top:10px;">
+                                    <div style="font-size:22px; font-weight:800;">{price_text}</div>
+                                    <div style="font-size:22px; font-weight:800; color:{color};">{emoji} {change_text}</div>
+                                  </div>
+                                </div>
+                                """,
+                                unsafe_allow_html=True
+                            )
+                        else:
+                            candidates = suggest_board_candidates(key, normalized_all_pool, top=3)
+                            hint = " / ".join(candidates) if candidates else ""
+                            tip = f"候选：{hint}" if hint else "请尝试修改标签名"
+                            st.markdown(
+                                f"""
+                                <div style="background-color:#ffffff; color:#000000; padding:15px; border-radius:10px; box-shadow:0 1px 3px rgba(0,0,0,0.1); margin-bottom:12px;">
+                                  <div style="font-weight:700; font-size:16px;">{tag}</div>
+                                  <div style="margin-top:6px; font-size:12px; color:#666;">⚠️ 未找到相关板块</div>
+                                  <div style="margin-top:6px; font-size:12px; color:#666;">{tip}</div>
+                                </div>
+                                """,
+                                unsafe_allow_html=True
+                            )
 
     st.markdown("### 持仓详情")
     col_filter, col_refresh = st.columns([3, 1])
@@ -1118,6 +1325,8 @@ def main():
             st.radio("选择分组", groups, horizontal=True, key="selected_group", index=0)
     with col_refresh:
         if st.button("🔄 手动刷新", use_container_width=True, type="primary"):
+            get_current_funds(force_refresh=True)
+            st.session_state.last_update = datetime.now()
             st.rerun()
 
     selected_group = st.session_state.selected_group
