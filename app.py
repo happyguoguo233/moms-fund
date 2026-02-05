@@ -9,7 +9,7 @@ import requests
 import random
 from datetime import datetime
 import concurrent.futures
-import plotly.graph_objects as go
+import pytz
 
 import traceback
 
@@ -130,6 +130,12 @@ def inject_custom_css():
         div[data-testid="stExpander"] {{
             width: 100% !important;
         }}
+        [data-testid="stSidebarCollapsedControl"] {{
+            transform: scale(1.3);
+            background: #FFE5E5;
+            border-radius: 10px;
+            padding: 6px;
+        }}
 
         @media (max-width: 600px) {{
             html, body, [class*="css"] {{
@@ -148,6 +154,30 @@ def inject_custom_css():
         }}
         </style>
     """, unsafe_allow_html=True)
+
+def normalize_stock_code(value):
+    value_str = str(value).strip()
+    if not value_str:
+        return ""
+    if value_str.lower().startswith("hk"):
+        digits = re.sub(r"\D", "", value_str)
+        return digits.zfill(5) if digits else ""
+    digits = re.sub(r"\D", "", value_str)
+    if len(digits) >= 6:
+        return digits[-6:]
+    if len(digits) == 5 and digits.startswith("0"):
+        return digits
+    return digits
+
+def is_hk_stock(code, name):
+    digits = re.sub(r"\D", "", str(code))
+    if digits and len(digits) == 5 and digits.startswith("0"):
+        return True
+    if "HK" in str(name).upper():
+        return True
+    if str(code).lower().startswith("hk"):
+        return True
+    return False
 
 # ==========================================
 # 数据存储管理
@@ -221,7 +251,7 @@ def get_market_index(symbol_name, symbol_code):
     except Exception:
         return None
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600, persist="disk")
 def get_all_funds_list():
     """获取所有基金列表（用于搜索）"""
     try:
@@ -234,20 +264,20 @@ def get_stock_realtime_price_batch(stock_codes):
     """
     批量获取股票实时行情 (利用 A 股实时接口)
     """
-    def normalize_code(value):
-        return str(value).split(".")[-1][-6:]
-
     if not stock_codes:
         if LAST_A_STOCK_CACHE["price_map"] and LAST_A_STOCK_CACHE["change_map"]:
             return LAST_A_STOCK_CACHE["price_map"], LAST_A_STOCK_CACHE["change_map"]
         return {}, {}
 
     if isinstance(stock_codes, (list, tuple, set)):
-        wanted = {normalize_code(c) for c in stock_codes}
+        wanted = {normalize_stock_code(c) for c in stock_codes}
     else:
-        wanted = {normalize_code(stock_codes)}
+        wanted = {normalize_stock_code(stock_codes)}
+    wanted = {c for c in wanted if c}
 
     def to_tencent_code(code):
+        if len(code) == 5 and code.startswith("0"):
+            return f"hk{code}"
         if code.startswith("6"):
             return f"sh{code}"
         if code.startswith("0") or code.startswith("3"):
@@ -256,8 +286,10 @@ def get_stock_realtime_price_batch(stock_codes):
             return f"bj{code}"
         return None
 
-    tencent_codes = [to_tencent_code(c) for c in wanted]
-    tencent_codes = [c for c in tencent_codes if c]
+    tencent_items = [(to_tencent_code(c), c) for c in wanted]
+    tencent_items = [(t, c) for t, c in tencent_items if t]
+    tencent_codes = [t for t, _ in tencent_items]
+    code_map = {t: c for t, c in tencent_items}
     if not tencent_codes:
         if LAST_A_STOCK_CACHE["price_map"] and LAST_A_STOCK_CACHE["change_map"]:
             price_map = LAST_A_STOCK_CACHE["price_map"]
@@ -307,9 +339,14 @@ def get_stock_realtime_price_batch(stock_codes):
                     prev_close = 0.0
                 if pd.isna(change_pct):
                     change_pct = (latest - prev_close) / prev_close * 100 if prev_close > 0 else 0.0
-                code = code_with_prefix[-6:]
-                price_map[code] = float(latest)
-                change_map[code] = float(change_pct)
+                code_key = code_map.get(code_with_prefix)
+                if not code_key:
+                    if code_with_prefix.startswith("hk"):
+                        code_key = code_with_prefix[2:]
+                    else:
+                        code_key = code_with_prefix[-6:]
+                price_map[code_key] = float(latest)
+                change_map[code_key] = float(change_pct)
             except Exception:
                 continue
 
@@ -384,9 +421,16 @@ def get_fund_portfolio(fund_code):
 
         portfolio = []
         for _, row in df_latest.iterrows():
+            code_value = str(row[code_col])
+            name_value = row[name_col]
+            digits = re.sub(r"\D", "", code_value)
+            code_norm = digits[-6:] if len(digits) >= 6 else digits
+            if is_hk_stock(code_value, name_value):
+                if digits:
+                    code_norm = digits[-5:].zfill(5)
             portfolio.append({
-                "code": str(row[code_col]),
-                "name": row[name_col],
+                "code": code_norm,
+                "name": name_value,
                 "ratio": float(row[ratio_col])
             })
         return portfolio
@@ -394,40 +438,6 @@ def get_fund_portfolio(fund_code):
         traceback.print_exc()
         print(f"获取基金持仓失败: {e}")
         return []
-
-@st.cache_data(ttl=3600)
-def get_fund_history(fund_code):
-    """获取基金历史净值走势"""
-    try:
-        # 获取单位净值走势
-        # 修正参数名为 symbol
-        df = ak.fund_open_fund_info_em(symbol=fund_code, indicator="单位净值走势")
-        if not df.empty:
-            df['净值日期'] = pd.to_datetime(df['净值日期'])
-            df['单位净值'] = pd.to_numeric(df['单位净值'], errors='coerce')
-            return df
-        return pd.DataFrame()
-    except:
-        return pd.DataFrame()
-
-@st.cache_data(ttl=3600)
-def get_market_index_history(symbol):
-    """获取大盘指数历史走势"""
-    try:
-        # 特殊处理恒生科技
-        if symbol == "HK_HSTECH":
-            # 暂时无法获取港股指数历史，返回空
-            return pd.DataFrame()
-            
-        # A股指数
-        df = ak.stock_zh_index_daily_em(symbol=symbol)
-        if not df.empty:
-            df['date'] = pd.to_datetime(df['date'])
-            df['close'] = pd.to_numeric(df['close'], errors='coerce')
-            return df
-        return pd.DataFrame()
-    except:
-        return pd.DataFrame()
 
 @st.cache_data(ttl=60)
 def get_all_market_indices():
@@ -481,6 +491,99 @@ def get_all_market_indices():
         print(f"获取大盘指数失败: {e}")
         return results
 
+def pick_col(dataframe, candidates, contains=None):
+    for c in candidates:
+        if c in dataframe.columns:
+            return c
+    if contains:
+        for c in dataframe.columns:
+            if any(k in str(c) for k in contains):
+                return c
+    return None
+
+def normalize_board_keyword(text):
+    if text is None:
+        return ""
+    s = str(text).strip().lower()
+    s = re.sub(r"\s+", "", s)
+    s = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", s)
+    for w in ["基金", "混合", "指数", "行业", "概念", "板块", "主题", "赛道"]:
+        s = s.replace(w, "")
+    return s
+
+def suggest_board_candidates(key, pool_pairs, top=3):
+    if not key:
+        return []
+    key_set = set(key)
+    scored = []
+    for name, norm in pool_pairs:
+        if not norm:
+            continue
+        common = len(key_set.intersection(set(norm)))
+        if common <= 0:
+            continue
+        score = common / max(len(key_set), 1)
+        scored.append((score, len(norm), name))
+    scored.sort(key=lambda x: (-x[0], x[1], x[2]))
+    return [x[2] for x in scored[:top]]
+
+@st.cache_data(ttl=300)
+def get_board_spot_map():
+    result = {}
+    try:
+        industry = ak.stock_board_industry_spot_em()
+    except Exception:
+        industry = pd.DataFrame()
+    try:
+        concept = ak.stock_board_concept_spot_em()
+    except Exception:
+        concept = pd.DataFrame()
+
+    def update(df):
+        if df.empty:
+            return
+        name_col = pick_col(df, ["板块名称", "名称", "概念名称", "行业名称"], contains=["板块", "概念", "行业", "名称"])
+        price_col = pick_col(df, ["最新价", "最新", "最新点数", "指数", "收盘"], contains=["最新", "点", "指数", "收盘"])
+        change_col = pick_col(df, ["涨跌幅", "涨跌幅%", "涨跌幅(%)"], contains=["涨跌幅"])
+        if not name_col:
+            return
+        for _, row in df.iterrows():
+            name = str(row[name_col]).strip()
+            if not name:
+                continue
+            price_val = pd.to_numeric(row[price_col], errors="coerce") if price_col else None
+            change_val = pd.to_numeric(row[change_col], errors="coerce") if change_col else None
+            result[name] = {
+                "price": None if price_val is None or pd.isna(price_val) else float(price_val),
+                "change": None if change_val is None or pd.isna(change_val) else float(change_val)
+            }
+
+    update(industry)
+    update(concept)
+    return result
+
+@st.cache_data(ttl=3600, persist="disk")
+def get_board_name_pool_fallback():
+    names = []
+    try:
+        industry = ak.stock_board_industry_name_em()
+    except Exception:
+        industry = pd.DataFrame()
+    try:
+        concept = ak.stock_board_concept_name_em()
+    except Exception:
+        concept = pd.DataFrame()
+    if not industry.empty:
+        name_col = pick_col(industry, ["板块名称", "名称", "行业名称"], contains=["板块", "名称", "行业"])
+        if name_col:
+            names.extend(industry[name_col].dropna().astype(str).tolist())
+    if not concept.empty:
+        name_col = pick_col(concept, ["板块名称", "名称", "概念名称"], contains=["板块", "名称", "概念"])
+        if name_col:
+            names.extend(concept[name_col].dropna().astype(str).tolist())
+    names = [n.strip() for n in names if str(n).strip()]
+    return list(dict.fromkeys(names))
+
 # ==========================================
 # 核心数据获取逻辑 (并发加速 + 重仓股估值)
 # ==========================================
@@ -498,6 +601,20 @@ def calculate_fund_valuation(fund_code, fund_name, a_prices, a_changes, portfoli
             
         last_nav = float(df_nav.iloc[-1]['单位净值'])
         last_date = str(df_nav.iloc[-1]['净值日期'])
+        last_nav_date = pd.to_datetime(df_nav.iloc[-1]['净值日期']).date()
+        now = datetime.now(pytz.timezone('Asia/Shanghai'))
+        if last_nav_date == now.date():
+            return {
+                "code": fund_code,
+                "name": fund_name,
+                "current_price": last_nav,
+                "change_pct": 0.0,
+                "nav_date": last_date,
+                "update_time": "✅ 官方更新",
+                "is_estimated": False,
+                "portfolio": [],
+                "last_nav": last_nav
+            }
         
         if not a_changes:
             return {
@@ -505,6 +622,7 @@ def calculate_fund_valuation(fund_code, fund_name, a_prices, a_changes, portfoli
                 "name": fund_name,
                 "current_price": last_nav,
                 "change_pct": 0.0,
+                "nav_date": last_date,
                 "update_time": "暂无实时 (昨日净值)",
                 "is_estimated": False,
                 "portfolio": [],
@@ -522,6 +640,7 @@ def calculate_fund_valuation(fund_code, fund_name, a_prices, a_changes, portfoli
                 "name": fund_name,
                 "current_price": last_nav,
                 "change_pct": 0.0, # 无法估算
+                "nav_date": last_date,
                 "update_time": last_date + " (无持仓数据)",
                 "is_estimated": False,
                 "portfolio": []
@@ -534,7 +653,7 @@ def calculate_fund_valuation(fund_code, fund_name, a_prices, a_changes, portfoli
         portfolio_details = []
         
         for stock in portfolio:
-            s_code = str(stock['code']).split(".")[-1][-6:]
+            s_code = normalize_stock_code(stock['code'])
             ratio = stock['ratio']
             
             change = 0.0
@@ -554,13 +673,6 @@ def calculate_fund_valuation(fund_code, fund_name, a_prices, a_changes, portfoli
             
         # 归一化估算 (假设未持仓部分涨跌幅为 0 或跟随大盘，这里简单处理为只看重仓股)
         # 如果 total_ratio 太小（比如 < 30%），估算可能极不准
-        estimated_change_pct = weighted_change_sum / total_ratio if total_ratio > 0 else 0.0
-        
-        # 修正：如果 total_ratio 只有 50%，剩下的 50% 假设不动？
-        # 通常做法：estimated_change_pct = weighted_change_sum / 100 (假设其他部分不动)
-        # 或者 estimated_change_pct = weighted_change_sum / total_ratio (假设其他部分和重仓股同频)
-        # 这里采用折中：weighted_change_sum / 100 比较保守，但更真实（因为债券部分通常波动小）
-        # 也就是： 基金涨跌 = Σ(股票涨跌 * 占比%) 
         estimated_change_pct = weighted_change_sum / 100.0
         
         estimated_price = last_nav * (1 + estimated_change_pct / 100)
@@ -570,7 +682,8 @@ def calculate_fund_valuation(fund_code, fund_name, a_prices, a_changes, portfoli
             "name": fund_name,
             "current_price": estimated_price,
             "change_pct": estimated_change_pct,
-            "update_time": datetime.now().strftime("%H:%M:%S") + " (估)",
+            "nav_date": last_date,
+            "update_time": now.strftime("%H:%M:%S") + " (估)",
             "is_estimated": True,
             "portfolio": portfolio_details,
             "last_nav": last_nav
@@ -589,6 +702,9 @@ def fetch_all_funds_data(funds_list):
     results = {}
     portfolio_map = {}
     wanted_codes = set()
+    total_steps = max(len(funds_list) * 2, 1)
+    completed = 0
+    bar = st.progress(0, text="正在帮妈妈去交易所抄价格...")
 
     def fetch_portfolio_item(fund):
         code = fund.get("code")
@@ -601,42 +717,49 @@ def fetch_all_funds_data(funds_list):
             print(f"获取持仓失败 {code}: {e}")
             return code, []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        futures = [executor.submit(fetch_portfolio_item, fund) for fund in funds_list]
-        for future in concurrent.futures.as_completed(futures):
-            code, portfolio = future.result()
-            portfolio_map[code] = portfolio or []
-            for stock in portfolio_map[code]:
-                s_code = str(stock['code']).split(".")[-1][-6:]
-                if s_code:
-                    wanted_codes.add(s_code)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [executor.submit(fetch_portfolio_item, fund) for fund in funds_list]
+            for future in concurrent.futures.as_completed(futures):
+                code, portfolio = future.result()
+                portfolio_map[code] = portfolio or []
+                for stock in portfolio_map[code]:
+                    s_code = normalize_stock_code(stock['code'])
+                    if s_code:
+                        wanted_codes.add(s_code)
+                completed += 1
+                bar.progress(min(completed / total_steps, 1.0), text="正在帮妈妈去交易所抄价格...")
 
-    a_prices, a_changes = {}, {}
-    if wanted_codes:
-        try:
-            a_prices, a_changes = get_stock_realtime_price_batch(list(wanted_codes))
-        except Exception as e:
-            traceback.print_exc()
-            print(f"获取全市场行情失败: {e}")
-    
-    for f in funds_list:
-        code = f.get("code")
-        try:
-            data = calculate_fund_valuation(
-                f.get("code"),
-                f.get("name"),
-                a_prices,
-                a_changes,
-                portfolio_map.get(code, [])
-            )
-            if data:
-                results[code] = data
-            else:
+        a_prices, a_changes = {}, {}
+        if wanted_codes:
+            try:
+                a_prices, a_changes = get_stock_realtime_price_batch(list(wanted_codes))
+            except Exception as e:
+                traceback.print_exc()
+                print(f"获取全市场行情失败: {e}")
+        
+        for f in funds_list:
+            code = f.get("code")
+            try:
+                data = calculate_fund_valuation(
+                    f.get("code"),
+                    f.get("name"),
+                    a_prices,
+                    a_changes,
+                    portfolio_map.get(code, [])
+                )
+                if data:
+                    results[code] = data
+                else:
+                    results[code] = None
+            except Exception:
+                traceback.print_exc()
                 results[code] = None
-        except Exception:
-            traceback.print_exc()
-            results[code] = None
-    return results
+            completed += 1
+            bar.progress(min(completed / total_steps, 1.0), text="正在帮妈妈去交易所抄价格...")
+        return results
+    finally:
+        bar.empty()
 
 def validate_fund_code(code):
     """验证基金代码并返回名称"""
@@ -689,77 +812,152 @@ def render_sidebar(current_funds):
                 time.sleep(1) # 简单的轮询等待
                 st.rerun()
 
-        with st.expander("➕ 添加单个基金", expanded=True):
-            st.markdown("##### 🔍 基金搜索")
-            all_funds_df = get_all_funds_list()
-            selected_fund = None
-            if not all_funds_df.empty and "基金代码" in all_funds_df.columns and "基金简称" in all_funds_df.columns:
-                options = all_funds_df[["基金代码", "基金简称"]].dropna().to_dict("records")
-                def format_option(option):
-                    name = str(option.get("基金简称", ""))
-                    if len(name) > 12:
-                        name = name[:12] + "…"
-                    return f"{option.get('基金代码', '')} | {name}"
-                try:
-                    selected_option = st.selectbox(
-                        "输入名称或代码搜索",
-                        options,
-                        index=None,
-                        placeholder="如: 华夏成长 / 000001",
-                        format_func=format_option
-                    )
-                except TypeError:
-                    selected_option = st.selectbox(
-                        "输入名称或代码搜索",
-                        options,
-                        index=None,
-                        format_func=format_option
-                    )
-                if selected_option:
-                    selected_fund = {"name": selected_option.get("基金简称", ""), "code": selected_option.get("基金代码", "")}
-            else:
-                st.warning("基金列表加载失败，请稍后重试")
+        def _do_add_fund(code, cost, shares, group_name):
+            try:
+                df_nav = ak.fund_open_fund_info_em(symbol=code, indicator="单位净值走势")
+            except Exception:
+                df_nav = pd.DataFrame()
+            if df_nav.empty:
+                st.error("基金代码不存在")
+                return
 
-            st.markdown("---")
-            with st.form("add_fund_form"):
-                # 如果从搜索选择了，自动填充
-                default_code = selected_fund['code'] if selected_fund else ""
-                default_name = selected_fund['name'] if selected_fund else ""
-                
-                f_code = st.text_input("基金代码 (6位)", value=default_code, max_chars=6)
-                f_name = st.text_input("基金名称 (方便记忆)", value=default_name)
-                f_cost = st.number_input("持仓成本 (元)", min_value=0.0, value=0.0, step=0.01, format="%.4f")
-                f_shares = st.number_input("持有份额 (份)", min_value=0.0, value=0.0, step=100.0)
-                f_group = st.text_input("分组标签", value="默认")
-                
-                submitted = st.form_submit_button("添加 / 更新")
-                if submitted:
-                    if len(f_code) != 6:
-                        st.error("请输入正确的6位基金代码")
+            fund_name = None
+            all_funds_df = get_all_funds_list()
+            if not all_funds_df.empty and "基金代码" in all_funds_df.columns and "基金简称" in all_funds_df.columns:
+                match = all_funds_df[all_funds_df["基金代码"].astype(str) == code]
+                if not match.empty:
+                    fund_name = str(match.iloc[0].get("基金简称", "")).strip() or None
+            if not fund_name:
+                fund_name = f"基金{code}"
+
+            new_entry = {
+                "code": code,
+                "name": fund_name,
+                "cost": float(cost),
+                "shares": float(shares),
+                "group": group_name
+            }
+
+            updated = False
+            for i, f in enumerate(current_funds):
+                if f.get("code") == code:
+                    current_funds[i] = new_entry
+                    updated = True
+                    break
+            if not updated:
+                current_funds.append(new_entry)
+
+            save_funds(current_funds)
+            st.session_state.pop("add_fund_candidates", None)
+            st.session_state.pop("add_fund_pending_payload", None)
+            st.success(f"已添加: {fund_name}")
+            time.sleep(1)
+            st.rerun()
+
+        st.subheader("➕ 添加基金")
+        with st.form("add_fund_all_in_one_sidebar"):
+            query = st.text_input("基金代码/名称", key="add_fund_query")
+            col1, col2 = st.columns(2)
+            with col1:
+                f_cost = st.number_input("成本 (元)", min_value=0.0, value=0.0, step=0.01, format="%.4f", key="add_fund_cost")
+            with col2:
+                f_shares = st.number_input("份额 (份)", min_value=0.0, value=0.0, step=100.0, key="add_fund_shares")
+
+            all_tags = sorted(list(set(f.get("group", "默认") for f in current_funds)))
+            if "默认" not in all_tags:
+                all_tags.append("默认")
+            tag_options = all_tags + ["➕新建..."]
+            f_group = st.selectbox("分组标签", options=tag_options, index=tag_options.index("默认") if "默认" in tag_options else 0, key="add_fund_group")
+            new_group_name = ""
+            if f_group == "➕新建...":
+                new_group_name = st.text_input("新建标签名", key="add_fund_new_group")
+
+            submitted = st.form_submit_button("➕ 添加基金", use_container_width=True)
+            if submitted:
+                q = str(query or "").strip()
+                group_name = new_group_name.strip() if f_group == "➕新建..." else f_group
+                if f_group == "➕新建..." and not group_name:
+                    st.error("请输入新建标签名")
+                elif not q:
+                    st.error("请输入基金代码或名称")
+                elif re.fullmatch(r"\d{6}", q):
+                    _do_add_fund(q, f_cost, f_shares, group_name)
+                else:
+                    all_funds_df = get_all_funds_list()
+                    if all_funds_df.empty or "基金代码" not in all_funds_df.columns or "基金简称" not in all_funds_df.columns:
+                        st.error("基金列表加载失败，请稍后重试")
                     else:
-                        # 检查是否已存在，存在则更新，不存在则追加
-                        new_entry = {
-                            "code": f_code,
-                            "name": f_name if f_name else f"基金{f_code}",
-                            "cost": f_cost,
-                            "shares": f_shares,
-                            "group": f_group
-                        }
-                        
-                        # 更新逻辑
-                        updated = False
-                        for i, f in enumerate(current_funds):
-                            if f['code'] == f_code:
-                                current_funds[i] = new_entry
-                                updated = True
-                                break
-                        if not updated:
-                            current_funds.append(new_entry)
-                        
+                        df = all_funds_df.copy()
+                        df["基金代码"] = df["基金代码"].astype(str)
+                        df["基金简称"] = df["基金简称"].astype(str)
+                        mask = df["基金代码"].str.contains(q, case=False, na=False) | df["基金简称"].str.contains(q, case=False, na=False)
+                        cand = df.loc[mask, ["基金代码", "基金简称"]].dropna()
+                        if cand.empty:
+                            st.error("未找到匹配的基金，请输入更完整的名称")
+                        else:
+                            exact = cand[cand["基金简称"].str.strip() == q]
+                            if not exact.empty:
+                                row = exact.iloc[0]
+                                _do_add_fund(str(row["基金代码"]), f_cost, f_shares, group_name)
+                            else:
+                                top = cand.head(30).to_dict("records")
+                                st.session_state["add_fund_candidates"] = top
+                                st.session_state["add_fund_pending_payload"] = {
+                                    "cost": float(f_cost),
+                                    "shares": float(f_shares),
+                                    "group": group_name
+                                }
+                                st.warning("匹配到多只基金，请在下方选择后确认添加")
+
+        candidates = st.session_state.get("add_fund_candidates") or []
+        payload = st.session_state.get("add_fund_pending_payload") or {}
+        if candidates and payload:
+            def _fmt(opt):
+                return f"{opt.get('基金代码','')} | {opt.get('基金简称','')}"
+
+            selected = st.selectbox("请选择匹配基金", candidates, format_func=_fmt, key="add_fund_candidate_selected")
+            if st.button("确认添加", use_container_width=True, key="confirm_add_fund"):
+                code = str(selected.get("基金代码", "")).strip()
+                if not re.fullmatch(r"\d{6}", code):
+                    st.error("基金代码无效")
+                else:
+                    _do_add_fund(code, payload.get("cost", 0.0), payload.get("shares", 0.0), payload.get("group", "默认"))
+
+        with st.expander("🏷️ 标签管理"):
+            tags = sorted(list(set(f.get("group", "默认") for f in current_funds)))
+            if not tags:
+                st.info("暂无标签")
+            else:
+                selected_tag = st.selectbox("选择标签", tags)
+                new_tag_name = st.text_input("新标签名称", value=selected_tag)
+                col_rename, col_delete = st.columns(2)
+                if col_rename.button("重命名", use_container_width=True):
+                    if not new_tag_name.strip():
+                        st.error("请输入新标签名称")
+                    else:
+                        for f in current_funds:
+                            if f.get("group", "默认") == selected_tag:
+                                f["group"] = new_tag_name.strip()
                         save_funds(current_funds)
-                        st.success(f"已保存: {new_entry['name']}")
+                        st.success("标签已更新")
                         time.sleep(1)
                         st.rerun()
+                if col_delete.button("删除", use_container_width=True):
+                    for f in current_funds:
+                        if f.get("group", "默认") == selected_tag:
+                            f["group"] = "默认"
+                    save_funds(current_funds)
+                    st.success("标签已删除")
+                    time.sleep(1)
+                    st.rerun()
+
+        with st.expander("📋 无法命中？点此查询官方板块名"):
+            pool = get_board_name_pool_fallback()
+            kw = st.text_input("搜索板块名称", key="board_name_search")
+            df = pd.DataFrame({"板块名称": pool})
+            if kw.strip():
+                df = df[df["板块名称"].astype(str).str.contains(kw.strip(), case=False, na=False)]
+            st.dataframe(df, use_container_width=True, height=320)
 
         with st.expander("📂 批量导入"):
             st.caption("输入多个代码，用逗号分隔 (例如: 000001,000002)")
@@ -814,41 +1012,128 @@ def main():
 
     current_funds = load_funds()
     if "selected_group" not in st.session_state:
-        st.session_state.selected_group = "全部"
+        st.session_state.selected_group = None
     groups = ["全部"] + sorted(list(set(f.get("group", "默认") for f in current_funds)))
-    selected_group = st.session_state.selected_group
-    display_funds = current_funds if selected_group == "全部" else [f for f in current_funds if f.get('group') == selected_group]
 
     indices = get_all_market_indices()
     st.markdown("## 📊 市场大盘")
     if indices:
-        cols = st.columns(len(indices))
-        for i, idx in enumerate(indices):
-            with cols[i]:
-                val = float(idx.get("price", 0.0) or 0.0)
-                chg = float(idx.get("change_pct", 0.0) or 0.0)
-                if chg > 0:
-                    change_color = C_RED
-                    change_arrow = "▲"
-                elif chg < 0:
-                    change_color = C_GREEN
-                    change_arrow = "▼"
-                else:
-                    change_color = C_GRAY
-                    change_arrow = ""
-                st.markdown(
-                    f"""
-                    <div style="padding:8px 10px; border:1px solid #eee; border-radius:10px; background:#fff;">
-                      <div style="font-size:18px; font-weight:800; color:#111 !important;">{idx.get('name','')}</div>
-                      <div style="font-size:30px; font-weight:900; color:#111 !important; line-height:1.1;">{val:.2f}</div>
-                      {render_change_html("涨跌幅", f"{chg:+.2f}%", change_color, change_arrow, value_size="18px", label_size="14px", arrow_size="18px", padding="4px 6px")}
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
+        for start in range(0, len(indices), 2):
+            cols = st.columns(2)
+            for j in range(2):
+                pos = start + j
+                with cols[j]:
+                    if pos >= len(indices):
+                        st.empty()
+                        continue
+                    idx = indices[pos]
+                    val = float(idx.get("price", 0.0) or 0.0)
+                    chg = float(idx.get("change_pct", 0.0) or 0.0)
+                    if chg > 0:
+                        change_color = "#d62728"
+                        change_emoji = "🔴"
+                    elif chg < 0:
+                        change_color = "#2ca02c"
+                        change_emoji = "🟢"
+                    else:
+                        change_color = "#7f7f7f"
+                        change_emoji = "⚪"
+                    st.markdown(
+                        f"""
+                        <div style="background-color: #ffffff; color: #000000; padding: 15px; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom: 12px;">
+                          <div style="font-weight:700; font-size:16px;">{idx.get('name','')}</div>
+                          <div style="display:flex; justify-content:space-between; align-items:baseline; margin-top:8px;">
+                            <div style="font-size:24px; font-weight:800;">{val:.2f}</div>
+                            <div style="font-size:24px; font-weight:800; color:{change_color};">{change_emoji} {chg:+.2f}%</div>
+                          </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
 
-    if not display_funds:
+    st.markdown("## 🧭 我的赛道")
+    tags = sorted(list(set(f.get("group", "默认") for f in current_funds)))
+    if not tags:
+        st.info("暂无标签")
+    else:
+        board_bar = st.progress(0, text="正在帮妈妈去交易所抄价格...")
+        try:
+            spot_map = get_board_spot_map()
+            spot_names = list(spot_map.keys())
+            name_pool = get_board_name_pool_fallback()
+            all_names = list(dict.fromkeys(spot_names + name_pool))
+            normalized_all_pool = [(n, normalize_board_keyword(n)) for n in all_names]
+            total = max(len(tags), 1)
+            for i, tag in enumerate(tags, start=1):
+                raw_key = str(tag).strip()
+                key = normalize_board_keyword(raw_key)
+                matches = [n for n, norm in normalized_all_pool if key and norm and (key in norm or norm in key)]
+                if matches:
+                    match = sorted(
+                        matches,
+                        key=lambda x: (len(normalize_board_keyword(x)) or 10**9, len(x), x)
+                    )[0]
+                    info = spot_map.get(match, {}) if match in spot_map else {}
+                    price = info.get("price") if match in spot_map else None
+                    change = info.get("change") if match in spot_map else None
+                    price_text = "-" if price is None else f"{price:.2f}"
+                    change_text = "-" if change is None else f"{change:+.2f}%"
+                    if change is None:
+                        color = "#7f7f7f"
+                    elif change > 0:
+                        color = "#d62728"
+                    elif change < 0:
+                        color = "#2ca02c"
+                    else:
+                        color = "#7f7f7f"
+                    extra = "" if match in spot_map else " <span style='color:#7f7f7f; font-size:12px;'>(暂无实时行情)</span>"
+                    st.markdown(
+                        f"**{tag}**：{match}{extra} | {price_text} | <span style='color:{color}; font-weight:700;'>{change_text}</span>",
+                        unsafe_allow_html=True
+                    )
+                else:
+                    candidates = suggest_board_candidates(key, normalized_all_pool, top=3)
+                    if candidates:
+                        suggest_text = " / ".join(candidates)
+                        st.markdown(
+                            f"<span style='color:#7f7f7f; font-size:12px;'>⚠️ 未找到与【{tag}】相关的板块，请尝试修改标签名（候选：{suggest_text}）</span>",
+                            unsafe_allow_html=True
+                        )
+                    else:
+                        st.markdown(
+                            f"<span style='color:#7f7f7f; font-size:12px;'>⚠️ 未找到与【{tag}】相关的板块，请尝试修改标签名</span>",
+                            unsafe_allow_html=True
+                        )
+                board_bar.progress(min(i / total, 1.0), text="正在帮妈妈去交易所抄价格...")
+        finally:
+            board_bar.empty()
+
+    st.markdown("### 持仓详情")
+    col_filter, col_refresh = st.columns([3, 1])
+    with col_filter:
+        default_group = st.session_state.selected_group if st.session_state.selected_group in groups else None
+        try:
+            st.pills("选择分组", groups, key="selected_group", default=default_group)
+        except AttributeError:
+            st.radio("选择分组", groups, horizontal=True, key="selected_group", index=0)
+    with col_refresh:
+        if st.button("🔄 手动刷新", use_container_width=True, type="primary"):
+            st.rerun()
+
+    selected_group = st.session_state.selected_group
+    if selected_group is None:
+        st.info("👈 请点击上方分组标签查看详情")
+        render_sidebar(current_funds)
+        return
+
+    if not current_funds:
         st.info("👋 暂无基金，请在左侧添加。")
+        render_sidebar(current_funds)
+        return
+
+    display_funds = current_funds if selected_group == "全部" else [f for f in current_funds if f.get('group') == selected_group]
+    if not display_funds:
+        st.info("当前分组暂无基金。")
         render_sidebar(current_funds)
         return
 
@@ -872,6 +1157,7 @@ def main():
         current_price = None
         change_pct = None
         update_time = "-"
+        nav_date = "-"
         if m_data:
             current_price = m_data.get('current_price')
             try:
@@ -881,6 +1167,7 @@ def main():
             except Exception:
                 change_pct = 0.0
             update_time = m_data.get('update_time', "-")
+            nav_date = m_data.get("nav_date", "-")
 
         market_value = current_price * shares if current_price is not None else 0.0
         if current_price is not None and change_pct is not None:
@@ -923,8 +1210,11 @@ def main():
             "code": code,
             "name": name,
             "group": group,
+            "cost": cost,
+            "shares": shares,
             "current_price": current_price,
             "change_pct": change_pct,
+            "nav_date": nav_date,
             "update_time": update_time,
             "holding_profit": holding_profit,
             "change_color": change_color,
@@ -938,17 +1228,6 @@ def main():
     c2.metric("今日预估收益", f"¥ {total_day_profit:,.0f}", delta=f"{total_day_profit:,.0f}", delta_color="inverse")
     c3.metric("持仓基金数", f"{len(display_funds)} 支")
 
-    st.markdown("### 持仓详情")
-    col_filter, col_refresh = st.columns([3, 1])
-    with col_filter:
-        try:
-            st.pills("选择分组", groups, key="selected_group", default=st.session_state.selected_group)
-        except AttributeError:
-            st.radio("选择分组", groups, horizontal=True, key="selected_group", index=0)
-    with col_refresh:
-        if st.button("🔄 手动刷新", use_container_width=True, type="primary"):
-            st.rerun()
-
     for card in cards:
         code = card["code"]
         name = card["name"]
@@ -960,38 +1239,76 @@ def main():
         change_color = card["change_color"]
         profit_color = card["profit_color"]
         m_data = card["m_data"]
+        cost = card["cost"]
+        shares = card["shares"]
+        nav_date = card["nav_date"]
+        price_text = "-" if current_price is None else f"{current_price:.4f}"
+        if change_pct is None:
+            change_text = "-"
+            change_color = "#7f7f7f"
+            change_emoji = "⚪"
+        else:
+            change_text = f"{change_pct:+.2f}%"
+            if change_pct > 0:
+                change_color = "#d62728"
+                change_emoji = "🔴"
+            elif change_pct < 0:
+                change_color = "#2ca02c"
+                change_emoji = "🟢"
+            else:
+                change_color = "#7f7f7f"
+                change_emoji = "⚪"
 
-        with st.container(border=True):
-            st.markdown(
-                f"<div style='font-size:22px; font-weight:800;'>{name} <span style='color:#888; font-size:14px;'>{code}</span></div>",
-                unsafe_allow_html=True
-            )
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                value = "-" if current_price is None else f"{current_price:.4f}"
-                st.markdown(f"<div>预估净值</div><div style='font-size:20px; font-weight:800;'>{value}</div>", unsafe_allow_html=True)
-            with c2:
-                if change_pct is None:
-                    st.markdown(render_change_html("估算涨跌", "-", C_GRAY, "", value_size="24px", label_size="16px", arrow_size="20px"), unsafe_allow_html=True)
-                else:
-                    st.markdown(render_change_html("估算涨跌", f"{change_pct:+.2f}%", change_color, change_arrow, value_size="24px", label_size="16px", arrow_size="20px"), unsafe_allow_html=True)
-            with c3:
-                if holding_profit is None:
-                    st.markdown(render_change_html("持有收益", "-", C_GRAY, "", value_size="24px", label_size="16px", arrow_size="20px"), unsafe_allow_html=True)
-                else:
-                    st.markdown(render_change_html("持有收益", f"{holding_profit:+.2f}", profit_color, profit_arrow, value_size="24px", label_size="16px", arrow_size="20px"), unsafe_allow_html=True)
+        st.markdown(
+            f"""
+            <div style="background-color: #ffffff; color: #000000; padding: 15px; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom: 12px;">
+              <div style="display:flex; justify-content:space-between; align-items:center;">
+                <div style="font-weight:700; font-size:16px;">{name} ({code})</div>
+                <div style="color:#7f7f7f; font-size:12px;">{nav_date}</div>
+              </div>
+              <div style="display:flex; justify-content:space-between; align-items:baseline; margin-top:8px;">
+                <div style="font-size:24px; font-weight:800;">{price_text}</div>
+                <div style="font-size:24px; font-weight:800; color:{change_color};">{change_emoji} {change_text}</div>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
-            st.markdown(f"更新时间：{update_time}")
-            with st.expander("查看详情/操作"):
-                group_key = f"group_{code}"
-                new_group = st.text_input("分组标签", value=group, key=group_key)
-                if st.button("保存标签", key=f"save_group_{code}"):
+        st.markdown(f"更新时间：{update_time}")
+        with st.expander("查看详情/操作"):
+                edit_cost = st.number_input("持仓成本 (元)", min_value=0.0, value=float(cost), step=0.01, format="%.4f", key=f"edit_cost_{code}")
+                edit_shares = st.number_input("持有份额 (份)", min_value=0.0, value=float(shares), step=100.0, key=f"edit_shares_{code}")
+                if st.button("💾 更新持仓", key=f"save_holding_{code}"):
                     for i, f in enumerate(current_funds):
                         if f['code'] == code:
-                            current_funds[i]['group'] = new_group
+                            current_funds[i]['cost'] = edit_cost
+                            current_funds[i]['shares'] = edit_shares
                             break
                     save_funds(current_funds)
                     st.rerun()
+
+                existing_groups = sorted(list(set(f.get("group", "默认") for f in current_funds)))
+                if group not in existing_groups:
+                    existing_groups.append(group)
+                if "默认" not in existing_groups:
+                    existing_groups.append("默认")
+                group_options = existing_groups + ["➕ 新建标签..."]
+                group_key = f"group_{code}"
+                new_group = st.selectbox("分组标签", group_options, index=group_options.index(group) if group in group_options else 0, key=group_key)
+                new_group_name = ""
+                if new_group == "➕ 新建标签...":
+                    new_group_name = st.text_input("新标签名称", key=f"group_new_{code}")
+                if st.button("保存标签", key=f"save_group_{code}"):
+                    if new_group == "➕ 新建标签..." and not new_group_name.strip():
+                        st.error("请输入新标签名称")
+                    else:
+                        for i, f in enumerate(current_funds):
+                            if f['code'] == code:
+                                current_funds[i]['group'] = new_group_name.strip() if new_group == "➕ 新建标签..." else new_group
+                                break
+                        save_funds(current_funds)
+                        st.rerun()
 
                 if st.button("🗑 删除", key=f"del_{code}", type="secondary"):
                     new_list = [f for f in current_funds if f['code'] != code]
@@ -1013,81 +1330,27 @@ def main():
                         with p_cols[i % 5]:
                             val_change = float(stock.get('change', 0))
                             if val_change > 0:
-                                text_color = C_RED
-                                change_arrow = "▲"
+                                text_color = "#d62728"
+                                change_emoji = "🔴"
                             elif val_change < 0:
-                                text_color = C_GREEN
-                                change_arrow = "▼"
+                                text_color = "#2ca02c"
+                                change_emoji = "🟢"
                             else:
-                                text_color = C_GRAY
-                                change_arrow = ""
+                                text_color = "#7f7f7f"
+                                change_emoji = "⚪"
 
                             st.markdown(
                                 f"""
-                                <div style="border:1px solid #ddd; padding:5px; border-radius:5px; text-align:center; margin-bottom:5px; background-color: #fff;">
+                                <div style="background-color: #ffffff; color: #000000; padding: 15px; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom: 12px; text-align:center;">
                                     <div style="font-size:14px; font-weight:bold;">{stock['name']}</div>
                                     <div style="font-size:12px; color:#666;">占比 {stock['ratio']}%</div>
-                                    {render_change_html("涨跌幅", f"{val_change:+.2f}%", text_color, change_arrow, value_size="16px", label_size="12px", arrow_size="14px", padding="2px 4px")}
+                                    <div style="font-size:16px; font-weight:800; color:{text_color}; margin-top:6px;">{change_emoji} {val_change:+.2f}%</div>
                                 </div>
                                 """,
                                 unsafe_allow_html=True
                             )
                 else:
                     st.warning("暂无重仓股数据。")
-
-                st.markdown("###### 📈 业绩走势")
-                hist_df = get_fund_history(code)
-                if not hist_df.empty:
-                    hist_df = hist_df.sort_values('净值日期')
-                    range_options = ["当日", "近1周", "近1月", "近3月", "近半年", "近1年"]
-                    range_key = f"range_{code}"
-                    try:
-                        selected_range = st.segmented_control("选择区间", range_options, default="当日", key=range_key)
-                    except AttributeError:
-                        selected_range = st.radio("选择区间", range_options, horizontal=True, index=0, key=range_key)
-
-                    if selected_range == "当日":
-                        view_df = hist_df.tail(2)
-                    elif selected_range == "近1周":
-                        view_df = hist_df.tail(5)
-                    elif selected_range == "近1月":
-                        view_df = hist_df.tail(20)
-                    elif selected_range == "近3月":
-                        view_df = hist_df.tail(60)
-                    elif selected_range == "近半年":
-                        view_df = hist_df.tail(120)
-                    else:
-                        view_df = hist_df.tail(240)
-
-                    start_date = view_df['净值日期'].min()
-                    end_date = view_df['净值日期'].max()
-
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(
-                        x=view_df['净值日期'],
-                        y=view_df['单位净值'],
-                        mode='lines',
-                        name='单位净值',
-                        line=dict(color='#D22222', width=3),
-                        fill='tozeroy',
-                        fillcolor='rgba(210, 34, 34, 0.1)'
-                    ))
-                    fig.update_layout(
-                        margin=dict(l=0, r=0, t=10, b=0),
-                        height=350,
-                        xaxis=dict(
-                            type="date",
-                            tickformat="%m-%d"
-                        ),
-                        yaxis=dict(
-                            autorange=True,
-                            fixedrange=False
-                        ),
-                        hovermode="x unified"
-                    )
-                    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displayModeBar": False})
-                else:
-                    st.warning("暂无历史数据")
 
     render_sidebar(current_funds)
 
